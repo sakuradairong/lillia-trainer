@@ -1,5 +1,16 @@
 bin/
 obj/
-*.exe
+dist/
 temp/
+backups/
 trainer/backups/
+/ui-lint.txt
+/preview-*.png
+*.exe
+*.dll
+*.lib
+*.obj
+*.pdb
+*.zip
+*.log
+*.bak

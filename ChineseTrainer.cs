@@ -1,6 +1,6 @@
 // ============================================================================
 //  莉莉娅中文修改器 v2 (Novice Succubus Lillia - real-time memory trainer)
-//  独立 WinForms 单文件程序，无第三方依赖。
+//  WinForms 修改器；内嵌 LilliaOutfitBridge.dll，按需释放并加载原生换装组件。
 //
 //  v2 变化:
 //    - UI 全面重设计：侧边栏导航 + 卡片式布局 + 概览仪表盘
@@ -8,20 +8,20 @@
 //      拥有状态对比、未解锁清单、当前穿搭与发型查看
 //    - 跨容器移动在完整放置规则得到验证前保持禁用
 //
-//  构建 (C#5 / .NET Framework 4.0 内置 csc):
-//    set TEMP=<repo>\trainer\temp & set TMP=<repo>\trainer\temp
-//    C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe -nologo -codepage:65001
-//      -target:winexe -platform:x64 -optimize+ -out:..\莉莉娅中文修改器.exe
-//      -reference:System.dll -reference:System.Windows.Forms.dll
-//      -reference:System.Drawing.dll ChineseTrainer.cs
+//  构建 (在项目根目录执行；C#5 / .NET Framework 4.0 内置 csc + MSVC x64):
+//    .\trainer\build-outfit.ps1 -Check
+//    编译主界面、换装和仓库扩容模块，并嵌入 LilliaOutfitBridge.dll，
+//    运行离线检查，输出项目根目录的 莉莉娅中文修改器_整合修复版.exe
 //
 //  运行模式:
-//    默认          = 图形界面 (实时只读轮询，用户点击应用/开关才写入)
-//    --probe       = 只读，打印一行 JSON 描述当前存档
-//    --selftest    = 用进程内合成内存对象测试读取/写入代码，绝不接触真实游戏
-//    --preview     = 渲染界面到 trainer\preview.png
+//    默认           = 图形界面 (实时只读轮询，用户点击应用/开关才写入)
+//    --probe        = 只读，打印一行 JSON 描述当前存档
+//    --outfit-probe = 只读，识别当前换装界面与已拥有套装，打印 JSON
+//    --selftest     = 用进程内合成内存对象测试读取/写入代码，绝不接触真实游戏
+//    --preview      = 渲染界面到 trainer\preview.png
 //
-//  安全: 只操作既有基元字段与既有数组元素，不分配托管对象、不改写指针引用。
+//  安全: 普通字段写入仅操作既有基元字段与既有数组元素，不分配托管对象、不改写指针引用；
+//    换装仅在用户明确点击换装按钮后，通过游戏主线程原生接口分配/更新预设与配色数组、刷新外观。
 // ============================================================================
 using System;
 using System.Collections.Generic;
@@ -1085,7 +1085,7 @@ namespace LilliaTrainer
     }
 
     // ================================================================ GUI
-    internal sealed class MainForm : Form
+    internal sealed partial class MainForm : Form
     {
         private readonly string gameDir;
         private readonly string baseDir;
@@ -1155,7 +1155,7 @@ namespace LilliaTrainer
         {
             baseDir = AppDomain.CurrentDomain.BaseDirectory;
             gameDir = baseDir.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
-            Text = "莉莉娅中文修改器 · 修复版 - Novice Succubus Lillia";
+            Text = "莉莉娅中文修改器 · 整合修复版 - Novice Succubus Lillia";
             ClientSize = new Size(1180, 780);
             MinimumSize = new Size(1040, 680);
             StartPosition = FormStartPosition.CenterScreen;
@@ -1441,9 +1441,9 @@ namespace LilliaTrainer
             foreach (KeyValuePair<string, Control> kv in pages) kv.Value.Visible = kv.Key == key;
             string t = "概览"; string s = "实时内存只读轮询 · 点击应用才写入";
             if (key == "resource") { t = "资源与锁定"; s = "金币 / 精液储量 / 日期 / 难度 / 体型 / 耐力与三项持续锁定"; }
-            if (key == "inventory") { t = "背包"; s = "查看与修改既有物品 · 数量 / 补满 · 跨容器移动请在游戏内操作"; }
+            if (key == "inventory") { t = "背包"; s = "既有物品数量 / 补满 · 仓库扩容（保留物品位置）"; }
             if (key == "quest") { t = "任务"; s = "查看与写满既有任务进度，奖励仍需回游戏提交"; }
-            if (key == "wardrobe") { t = "服装图鉴"; s = "36 系列服装拥有状态对比 · 未解锁清单 · 当前穿搭与发型"; }
+            if (key == "wardrobe") { t = "服装图鉴"; s = "选择系列与配色，一键替换已有套装 · 保留发型与其他预设"; }
             if (key == "advanced") { t = "进阶数据"; s = "成就 / 掩码 / 开关 / 统计数组（按字段+下标）"; }
             pageTitle.Text = t;
             pageSub.Text = s;
@@ -1741,6 +1741,8 @@ namespace LilliaTrainer
                 Btn("刷新列表", 84, delegate(object s, EventArgs e) { RefreshInventory(true); })));
             lblInvInfo = CardLabel("", 900);
             fb.Controls.Add(Row(22, lblInvInfo));
+            AddWarehouseControls(fb);
+            bottom.Height = 160;
             bottom.Controls.Add(fb);
 
             page.Controls.Add(lvItems);
@@ -1805,6 +1807,7 @@ namespace LilliaTrainer
             lvDress.View = View.Details;
             lvDress.FullRowSelect = true;
             lvDress.MultiSelect = false;
+            lvDress.HideSelection = false;
             lvDress.BackColor = Theme.Card;
             lvDress.ForeColor = Theme.Text;
             lvDress.Font = Theme.F;
@@ -1818,16 +1821,17 @@ namespace LilliaTrainer
 
             Panel bottom = new Panel();
             bottom.Dock = DockStyle.Bottom;
-            bottom.Height = 118;
+            bottom.Height = 162;
             bottom.BackColor = Theme.Back;
             FlowLayoutPanel fb = new FlowLayoutPanel();
             fb.Dock = DockStyle.Fill;
             fb.FlowDirection = FlowDirection.TopDown;
             fb.WrapContents = false;
             fb.BackColor = Color.Transparent;
+            fb.Controls.Add(OutfitControls());
             lblDressInfo = CardLabel("", 1000);
             lblDressInfo.Height = 66;
-            fb.Controls.Add(Row(60, lblDressInfo));
+            fb.Controls.Add(Row(66, lblDressInfo));
             Label note = CardLabel("图鉴共 36 系列（提取自游戏资源目录）。未解锁服装可通过商店购买、地图掉落或活动事件获得；", 1000);
             fb.Controls.Add(Row(20, note));
             Label note2 = CardLabel("地图掉落表（generalDressDropItemIndex / specialDressDropItemIndex）在游戏运行数据中按需加载，本页仅标注拥有状态。", 1000);
@@ -2367,6 +2371,8 @@ namespace LilliaTrainer
             btnRefresh.Enabled = true;
             if (btnBackup != null) btnBackup.Enabled = true;
             if (btnUndo != null) btnUndo.Enabled = true;
+            UpdateOutfitEnabled(on);
+            UpdateWarehouseEnabled(on);
         }
 
         // ------------------------------------------------------------ 写入路径
@@ -2697,6 +2703,7 @@ namespace LilliaTrainer
             }
             lvItems.EndUpdate();
             lblInvInfo.Text = "共 " + items.Count + " 件物品。粉色行 = 已装备；跨容器移动请在游戏内操作。";
+            RefreshWarehouseCapacity(true);
         }
 
         private void ApplyItemCount()
@@ -2883,6 +2890,8 @@ namespace LilliaTrainer
         private void RefreshWardrobe(List<ItemView> items)
         {
             if (lvDress == null) return;
+            int selected = lvDress.SelectedIndices.Count > 0 ? lvDress.SelectedIndices[0] : -1;
+            outfitSelecting = true;
             int[] owned = DressCatalog.OwnedPieces(items);
             lvDress.BeginUpdate();
             lvDress.Items.Clear();
@@ -2914,6 +2923,9 @@ namespace LilliaTrainer
                 if (trackable && !own) missing.Add(s.Zh);
             }
             lvDress.EndUpdate();
+            if (selected >= 0 && selected < lvDress.Items.Count) lvDress.Items[selected].Selected = true;
+            outfitSelecting = false;
+            SelectOutfitSeries();
 
             int ownN = 0, trackN = 0;
             for (int i = 0; i < DressCatalog.All.Length; i++)
@@ -3262,6 +3274,7 @@ namespace LilliaTrainer
         private void RefreshIfStale(Snapshot s)
         {
             int key = s.Pid ^ (int)(s.Save & 0xFFFF) ^ (int)(s.Holder & 0xFFFF);
+            RefreshWarehouseIfStale(s);
             if (key != lastInvGen && lvItems != null && lvItems.Items.Count == 0) { RefreshInventory(false); lastInvGen = key; }
             if (key != lastQuestGen && lvQuests != null && lvQuests.Items.Count == 0) { RefreshQuests(false); lastQuestGen = key; }
             if (key != lastDressGen && lvDress != null && lvDress.Items.Count == 0) { RefreshWardrobe(s.Items); lastDressGen = key; }
@@ -3428,6 +3441,7 @@ namespace LilliaTrainer
         {
             string mode = args.Length > 0 ? args[0].ToLowerInvariant() : "";
             if (mode == "--probe") { Con.EnsureStdout(); return Probe(); }
+            if (mode == "--outfit-probe") { Con.EnsureStdout(); return OutfitProbe.Run(); }
             if (mode == "--diag") { Con.EnsureStdout(); return Diag(); }
             if (mode == "--selftest") { Con.EnsureStdout(); return SelfTest(); }
             if (mode == "--preview") { Con.EnsureStdout(); return Preview(); }
@@ -3613,6 +3627,7 @@ namespace LilliaTrainer
             foreach (string key in keys)
             {
                 f.ShowPagePublic(key);
+                if (key == "wardrobe") f.PrepareOutfitPreview();
                 Application.DoEvents();
                 System.Threading.Thread.Sleep(200);
                 Application.DoEvents();
@@ -3706,6 +3721,8 @@ namespace LilliaTrainer
             chk("标量范围：NaN/Inf 拒绝", !Limits.F64(double.NaN, 0, 1) && !Limits.F32(float.PositiveInfinity, 0f, 1f));
             chk("枚举越界拒绝", !Limits.I32(3, 0, 2) && !Limits.I32(5, 0, 4));
 
+            OutfitPlanner.SelfTest(chk);
+            WarehouseCapacity.SelfTest(chk);
             // ---- 服装目录 ----
             chk("服装目录共 36 系列", DressCatalog.All.Length == 36);
             int trackable = DressCatalog.TrackableSeriesCount();
@@ -4044,6 +4061,8 @@ namespace LilliaTrainer
                 Application.DoEvents();
                 chk("连接后数组类型和物品移动仍不可编辑", ui.SafetyControlsStayDisabled());
                 chk("程序化物品移动调用不连接或写入游戏", ui.BlockedMovementLeavesDisconnected());
+                ui.OutfitSafetySelfTest(chk);
+                ui.WarehouseSafetySelfTest(chk);
                 chk("默认窗口能滚动到进阶页底部", ui.ScrollAdvancedToBottom());
                 ui.Size = ui.MinimumSize;
                 Application.DoEvents();
