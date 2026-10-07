@@ -6,7 +6,7 @@
 //    - UI 全面重设计：侧边栏导航 + 卡片式布局 + 概览仪表盘
 //    - 新增「服装」页：36 系列服装图鉴（提取自游戏 catalog.json）、
 //      拥有状态对比、未解锁清单、当前穿搭与发型查看
-//    - 背包新增「移到背包 / 移到仓库」（修改既有容器字段，安全）
+//    - 跨容器移动在完整放置规则得到验证前保持禁用
 //
 //  构建 (C#5 / .NET Framework 4.0 内置 csc):
 //    set TEMP=<repo>\trainer\temp & set TMP=<repo>\trainer\temp
@@ -49,6 +49,7 @@ namespace LilliaTrainer
         public const int MaxListItems = 2000;
         public const int MaxQuests = 500;
         public const int MaxArrayElems = 512;
+        public const string ContainerMoveUnavailable = "跨容器移动暂不可用：尚未验证目标网格、容量和物品状态规则，请在游戏内移动。";
     }
 
     internal static class Off
@@ -622,16 +623,54 @@ namespace LilliaTrainer
         }
 
         // ---- 存档中的既有数组 ----
+        public static bool TryArrayKind(int offset, out ArrayKind kind)
+        {
+            switch (offset)
+            {
+                case Off.D0: case Off.A0: case Off.A8: case Off.B0: case Off.B8:
+                    kind = ArrayKind.I32; return true;
+                case Off.C0: case Off.C8:
+                    kind = ArrayKind.F64; return true;
+                default:
+                    kind = 0; return false;
+            }
+        }
+
         public static bool ReadArray(IMemory m, Chain c, int offset, ArrayKind kind, out ulong arr, out int len, out string err)
         {
             arr = 0; len = 0; err = null;
+            ArrayKind required;
+            if (!TryArrayKind(offset, out required) || required != kind)
+            { err = "统计字段或元素类型不匹配"; return false; }
+            if (m == null || c == null || !Addr.Valid(c.Save))
+            { err = "存档对象无效"; return false; }
             arr = M.PtrOr0(m, c.Save + (ulong)offset);
             if (arr == 0) { err = "数组为空"; return false; }
             if (!Addr.Valid(arr)) { err = "数组指针无效"; return false; }
+            string expected = required == ArrayKind.I32 ? "Int32[]" : "Double[]";
+            if (!string.Equals(M.ClassName(m, arr), expected, StringComparison.Ordinal))
+            { err = "实际数组类型不匹配，已拒绝访问"; return false; }
             ulong l;
             if (!M.ReadU64(m, arr + (ulong)Off.ArrayLength, out l)) { err = "无法读取数组长度"; return false; }
             if (l > (ulong)Cfg.MaxArrayElems) { err = "数组长度越界：" + l; return false; }
+            if (l > 0 && !Addr.Range(arr + (ulong)Off.ArrayData, (int)l * (int)required))
+            { err = "数组数据地址越界"; return false; }
             len = (int)l;
+            return true;
+        }
+
+        public static bool ArrayElementAddress(IMemory m, Chain c, int offset, ArrayKind kind,
+            int index, out ulong address, out string err)
+        {
+            address = 0;
+            ulong arr;
+            int len;
+            if (!ReadArray(m, c, offset, kind, out arr, out len, out err)) return false;
+            if (index < 0 || index >= len)
+            { err = "下标越界（数组长度 " + len + "）"; return false; }
+            address = arr + (ulong)Off.ArrayData + (ulong)index * (ulong)(int)kind;
+            if (!Addr.Range(address, (int)kind))
+            { address = 0; err = "元素地址越界"; return false; }
             return true;
         }
     }
@@ -868,6 +907,26 @@ namespace LilliaTrainer
         }
     }
 
+    internal static class WritePolicy
+    {
+        public static bool Current(Gen expected, int pid, long start, Chain current)
+        {
+            return expected != null && pid > 0 && start > 0 && current != null
+                && Addr.Valid(current.Holder) && Addr.Valid(current.Save)
+                && expected.Same(pid, start, current.Holder, current.Save);
+        }
+
+        // A rejected generation must never invoke the callback that can write memory.
+        public static bool ApplyLock(Gen expected, int pid, long start, Chain current,
+            IMemory memory, Func<IMemory, Chain, string> apply, out string error)
+        {
+            if (!Current(expected, pid, start, current) || memory == null || apply == null)
+            { error = "存档或进程身份已变化，锁定已停止；请刷新后重新启用"; return false; }
+            error = apply(memory, current);
+            return true;
+        }
+    }
+
     internal sealed class UndoEntry
     {
         public ulong Addr;
@@ -1043,7 +1102,6 @@ namespace LilliaTrainer
         private readonly List<UndoEntry> undo = new List<UndoEntry>();
         private int undoBytes;
         private readonly List<Control> writeControls = new List<Control>();
-        private int procStartPid = -1;
         private long procStartTicks;
         private readonly Dictionary<string, LockSpec> locks = new Dictionary<string, LockSpec>();
         private readonly HashSet<string> activeLocks = new HashSet<string>();
@@ -1073,6 +1131,7 @@ namespace LilliaTrainer
         private ListView lvItems;
         private TextBox txtItemCount;
         private Label lblInvInfo;
+        private Button btnMoveBackpack, btnMoveStorage;
         // ---- 任务 ----
         private ListView lvQuests;
         private TextBox txtQuestProgress;
@@ -1086,12 +1145,17 @@ namespace LilliaTrainer
         private TextBox txtAroused, txtArrayIndex, txtArrayValue;
         private ComboBox cboArrayField, cboArrayKind;
         private Label lblArrayInfo, lblEnding, lblFlags;
+        private Panel advancedScroll;
+        private Card advancedBottomCard;
+        public bool PreviewOnly { get; set; }
+
+        protected override bool ShowWithoutActivation { get { return PreviewOnly; } }
 
         public MainForm()
         {
             baseDir = AppDomain.CurrentDomain.BaseDirectory;
             gameDir = baseDir.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
-            Text = "莉莉娅中文修改器 - Novice Succubus Lillia";
+            Text = "莉莉娅中文修改器 · 修复版 - Novice Succubus Lillia";
             ClientSize = new Size(1180, 780);
             MinimumSize = new Size(1040, 680);
             StartPosition = FormStartPosition.CenterScreen;
@@ -1377,7 +1441,7 @@ namespace LilliaTrainer
             foreach (KeyValuePair<string, Control> kv in pages) kv.Value.Visible = kv.Key == key;
             string t = "概览"; string s = "实时内存只读轮询 · 点击应用才写入";
             if (key == "resource") { t = "资源与锁定"; s = "金币 / 精液储量 / 日期 / 难度 / 体型 / 耐力与三项持续锁定"; }
-            if (key == "inventory") { t = "背包"; s = "查看与修改既有物品 · 数量 / 补满 / 移动容器"; }
+            if (key == "inventory") { t = "背包"; s = "查看与修改既有物品 · 数量 / 补满 · 跨容器移动请在游戏内操作"; }
             if (key == "quest") { t = "任务"; s = "查看与写满既有任务进度，奖励仍需回游戏提交"; }
             if (key == "wardrobe") { t = "服装图鉴"; s = "36 系列服装拥有状态对比 · 未解锁清单 · 当前穿搭与发型"; }
             if (key == "advanced") { t = "进阶数据"; s = "成就 / 掩码 / 开关 / 统计数组（按字段+下标）"; }
@@ -1386,6 +1450,99 @@ namespace LilliaTrainer
         }
 
         public void ShowPagePublic(string key) { ShowPage(key); }
+
+        public void DiagTick() { Tick(null, null); }
+
+        public void DiagClickNullGen()
+        {
+            Console.WriteLine("=== 场景：gen未建立时勾选兔子警察 ===");
+            Console.WriteLine("gen=" + (gen == null ? "null" : "已建立"));
+            ShowPagePublic("advanced");
+            foreach (Control c in writeControls)
+            {
+                CheckBox cb = c as CheckBox;
+                if (cb == null) continue;
+                if (cb.Text.IndexOf("兔子警察", StringComparison.Ordinal) >= 0)
+                {
+                    Console.WriteLine("点击前 Checked=" + cb.Checked);
+                    cb.Checked = true;
+                }
+            }
+            System.Threading.Thread.Sleep(800);
+            Console.WriteLine("点击后800ms Checked=" + FindBunny().Checked + " gen=" + (gen == null ? "null" : "已建立"));
+            Tick(null, null);
+            Console.WriteLine("Tick后 内存值=" + snap.BunnyPolice + " 复选框=" + FindBunny().Checked);
+        }
+
+        private CheckBox FindBunny()
+        {
+            foreach (Control c in writeControls)
+            {
+                CheckBox cb = c as CheckBox;
+                if (cb != null && cb.Text.IndexOf("兔子警察", StringComparison.Ordinal) >= 0) return cb;
+            }
+            return null;
+        }
+
+        public void DiagClick()
+        {
+            // 端到端：先切到进阶页，再程序化勾选兔子警察复选框
+            ShowPagePublic("advanced");
+            foreach (Control c in writeControls)
+            {
+                CheckBox cb = c as CheckBox;
+                if (cb == null) continue;
+                if (cb.Text.IndexOf("兔子警察", StringComparison.Ordinal) >= 0)
+                {
+                    Console.WriteLine("点击前 Enabled=" + cb.Enabled + " Checked=" + cb.Checked + " 内存值=" + snap.BunnyPolice);
+                    cb.Checked = true;
+                    Console.WriteLine("点击后 Checked=" + cb.Checked);
+                }
+            }
+            Tick(null, null);
+            Console.WriteLine("Tick后 内存值=" + snap.BunnyPolice);
+            int i = 0;
+            foreach (Control c in writeControls)
+            {
+                CheckBox cb = c as CheckBox;
+                if (cb == null) continue;
+                if (cb.Text.IndexOf("兔子警察", StringComparison.Ordinal) >= 0)
+                    Console.WriteLine("最终复选框状态 Checked=" + cb.Checked + " Enabled=" + cb.Enabled);
+            }
+        }
+
+        public void DiagReport()
+        {
+            Console.WriteLine("=== 诊断 ===");
+            Console.WriteLine("snap.Connected=" + snap.Connected + " SaveLoaded=" + snap.SaveLoaded + " Pid=" + snap.Pid);
+            Console.WriteLine("mem=" + (mem == null ? "null" : ("pid" + mem.Pid + " canWrite=" + mem.CanWrite)));
+            bool w = mem != null && mem.EnsureWrite();
+            Console.WriteLine("EnsureWrite()=" + w);
+            Console.WriteLine("writeControls 数量=" + writeControls.Count);
+            // 找到两个进阶页复选框并报告状态
+            int found = 0;
+            foreach (Control c in writeControls)
+            {
+                CheckBox cb = c as CheckBox;
+                if (cb == null) continue;
+                if (cb.Text.IndexOf("兔子警察", StringComparison.Ordinal) >= 0 || cb.Text.IndexOf("无限游戏", StringComparison.Ordinal) >= 0)
+                {
+                    Console.WriteLine("chk '" + cb.Text + "' Enabled=" + cb.Enabled + " Visible=" + cb.Visible + " Checked=" + cb.Checked
+                        + " 父链可见=" + ParentVisible(cb));
+                    found++;
+                }
+            }
+            Console.WriteLine("目标复选框找到=" + found);
+            // 写权限真实测试（写当前值等于本身的地址不安全，改为只测句柄）
+            Console.WriteLine("s.BunnyPolice(内存)=" + snap.BunnyPolice + " s.InfinitePlay=" + snap.InfinitePlay);
+        }
+
+        private static bool ParentVisible(Control c)
+        {
+            for (Control p = c.Parent; p != null; p = p.Parent)
+                if (!p.Visible) return false;
+            return true;
+        }
 
         // -------------------------------------------------- 概览页
         private Panel BuildOverviewPage()
@@ -1571,13 +1728,16 @@ namespace LilliaTrainer
             fb.FlowDirection = FlowDirection.TopDown;
             fb.WrapContents = false;
             fb.BackColor = Color.Transparent;
+            btnMoveBackpack = Btn("移到背包", 84, delegate(object s, EventArgs e) { MoveSelectedContainer(1); });
+            btnMoveStorage = Btn("移到仓库", 84, delegate(object s, EventArgs e) { MoveSelectedContainer(3); });
+            btnMoveBackpack.Enabled = false;
+            btnMoveStorage.Enabled = false;
             fb.Controls.Add(Row(30,
                 Lbl("数量", 44, false), txtItemCount,
                 Btn("应用到选中", 92, delegate(object s, EventArgs e) { ApplyItemCount(); }),
                 Btn("补满选中", 84, delegate(object s, EventArgs e) { RefillSelected(); }),
                 Btn("补满全部消耗品", 116, delegate(object s, EventArgs e) { RefillConsumables(); }),
-                Btn("移到背包", 84, delegate(object s, EventArgs e) { MoveSelectedContainer(1); }),
-                Btn("移到仓库", 84, delegate(object s, EventArgs e) { MoveSelectedContainer(3); }),
+                btnMoveBackpack, btnMoveStorage,
                 Btn("刷新列表", 84, delegate(object s, EventArgs e) { RefreshInventory(true); })));
             lblInvInfo = CardLabel("", 900);
             fb.Controls.Add(Row(22, lblInvInfo));
@@ -1685,11 +1845,13 @@ namespace LilliaTrainer
         {
             Panel page = new Panel();
             page.BackColor = Theme.Back;
-            page.AutoScroll = true;
+            page.AutoScroll = false;
 
             Panel flow = new Panel();
             flow.Dock = DockStyle.Fill;
             flow.BackColor = Color.Transparent;
+            flow.AutoScroll = true;
+            advancedScroll = flow;
 
             Card c1 = new Card("存档计数与标记", 1024, 244);
             FlowLayoutPanel f1 = new FlowLayoutPanel();
@@ -1782,6 +1944,7 @@ namespace LilliaTrainer
                 "totalSpermByPosition +0xC0",
                 "tempSpermByPosition +0xC8" }, 0);
             cboArrayKind = Cbo(110, new string[] { "int32", "double" }, 0);
+            cboArrayKind.Enabled = false;
             cboArrayField.SelectedIndexChanged += delegate(object s, EventArgs e) { AutoKind(); };
             f5.Controls.Add(Row(30, Lbl("字段", 54, false), cboArrayField, Lbl("元素类型", 66, false), cboArrayKind,
                 Btn("读取", 70, delegate(object s, EventArgs e) { ReadArrayValue(); })));
@@ -1798,10 +1961,12 @@ namespace LilliaTrainer
 
             Card c6 = new Card("只读：结局相关状态（不提供修改）", 1024, 78);
             lblEnding = CardLabel("说明：待选结局 / 结局位属于存档一致性配对字段，本工具不提供修改，避免存档损坏。", 960);
-            lblEnding.Location = new Point(12, 8);
+            lblEnding.Location = new Point(12, 34);
             c6.Body.Controls.Add(lblEnding);
             c6.Location = new Point(20, 962);
             flow.Controls.Add(c6);
+            advancedBottomCard = c6;
+            flow.AutoScrollMinSize = new Size(c6.Right + 20, c6.Bottom + 20);
 
             page.Controls.Add(flow);
             return page;
@@ -1901,10 +2066,15 @@ namespace LilliaTrainer
             }
             if (target == null) { err = "未找到游戏进程（需要在游戏目录中运行本修改器）"; Detach(); return false; }
 
-            if (pid != target.Id || mem == null)
+            long targetStart;
+            try { targetStart = target.StartTime.Ticks; }
+            catch { err = "无法确认游戏进程身份，已停止连接"; Detach(); return false; }
+            if (targetStart <= 0) { err = "游戏进程身份无效"; Detach(); return false; }
+            if (pid != target.Id || procStartTicks != targetStart || mem == null)
             {
                 Detach();
                 pid = target.Id;
+                procStartTicks = targetStart;
                 mem = new ProcessMemory(pid);
                 hashOk = false;
                 hashPid = 0;
@@ -1987,6 +2157,7 @@ namespace LilliaTrainer
             hashPid = 0;
             gaBase = 0;
             pid = 0;
+            procStartTicks = 0;
             if (mem != null) { mem.Dispose(); mem = null; }
         }
 
@@ -1994,6 +2165,7 @@ namespace LilliaTrainer
         {
             c = null;
             err = null;
+            if (PreviewOnly) { err = "预览不连接游戏"; return false; }
             string aerr;
             if (!Attach(out aerr)) { err = aerr; return false; }
             return Resolver.Resolve(mem, gaBase, out c, out err);
@@ -2002,17 +2174,8 @@ namespace LilliaTrainer
         // 进程启动时间作为身份的一部分：即使 PID 被复用也能识别出这是新进程
         private long ProcStart()
         {
-            if (procStartPid == pid && pid != 0) return procStartTicks;
-            long t = 0;
-            try
-            {
-                using (System.Diagnostics.Process p = System.Diagnostics.Process.GetProcessById(pid))
-                    t = p.StartTime.Ticks;
-            }
-            catch { t = 0; }
-            procStartPid = pid;
-            procStartTicks = t;
-            return t;
+            // Attach reads the actual process start time on every refresh, including PID reuse.
+            return procStartTicks;
         }
 
         private bool BuildSnapshot(out Snapshot s, out string err)
@@ -2047,11 +2210,8 @@ namespace LilliaTrainer
                 string err;
                 if (!BuildSnapshot(out ns, out err))
                 {
+                    StopLocksAndUndo();
                     SetStatus("未连接：" + err, false);
-                    activeLocks.Clear();
-                    undo.Clear();
-                    undoBytes = 0;
-                    gen = null;
                     SetWritesEnabled(false);
                     snap = new Snapshot();
                     ClearDynamic();
@@ -2077,9 +2237,7 @@ namespace LilliaTrainer
                 string lockMsg = null;
                 if (ns.SaveLoaded && activeLocks.Count > 0)
                 {
-                    Chain c;
-                    string cerr;
-                    if (FreshChain(out c, out cerr) && c.Save != 0) lockMsg = ApplyLocks(c, false);
+                    lockMsg = ApplyLocks();
                 }
 
                 if (!ns.SaveLoaded)
@@ -2100,15 +2258,60 @@ namespace LilliaTrainer
             finally { busy = false; }
         }
 
-        private string ApplyLocks(Chain c, bool verbose)
+        /// <summary>若身份未建立，尝试按当前实时链建立（用于锁定启动等即时操作）。</summary>
+        private void EnsureGen()
+        {
+            Chain c;
+            string err;
+            if (!FreshChain(out c, out err)) return;
+            long start = ProcStart();
+            if (pid > 0 && start > 0 && Addr.Valid(c.Holder) && c.Save != 0)
+                gen = new Gen(pid, start, c.Holder, c.Save);
+        }
+
+        private void StopLocksAndUndo()
+        {
+            activeLocks.Clear();
+            undo.Clear();
+            undoBytes = 0;
+            gen = null;
+            if (chkSpermLock != null) chkSpermLock.Checked = false;
+            if (chkStamLock != null) chkStamLock.Checked = false;
+            if (chkDateLock != null) chkDateLock.Checked = false;
+        }
+
+        private string ApplyLockChecked(string key, Gen expected)
+        {
+            Chain current;
+            string error;
+            if (!FreshChain(out current, out error))
+            {
+                StopLocksAndUndo();
+                return error;
+            }
+            if (!WritePolicy.ApplyLock(expected, pid, ProcStart(), current, mem,
+                delegate(IMemory memory, Chain fresh)
+                {
+                    if (!mem.EnsureWrite()) return "无法获取写入权限，锁定未启用";
+                    return locks[key].Apply(memory, fresh);
+                }, out error))
+            {
+                StopLocksAndUndo();
+            }
+            return error;
+        }
+
+        private string ApplyLocks()
         {
             string last = null;
+            Gen expected = gen;
             foreach (string key in new List<string>(activeLocks))
             {
                 LockSpec ls;
                 if (!locks.TryGetValue(key, out ls)) continue;
-                string r = ls.Apply(mem, c);
+                string r = ApplyLockChecked(key, expected);
                 if (r != null) last = ls.Name + "：" + r;
+                if (activeLocks.Count == 0) break;
             }
             return last;
         }
@@ -2116,27 +2319,22 @@ namespace LilliaTrainer
         private void ToggleLock(string key, bool on)
         {
             if (!on) { activeLocks.Remove(key); SetStatus("已关闭锁定", true); return; }
-            string err;
-            Chain c;
-            if (!FreshChain(out c, out err) || c.Save == 0)
+            if (gen == null) EnsureGen();
+            Gen expected = gen;
+            if (expected == null)
             {
-                SetStatus("无法启用锁定：" + (err == null ? "存档未载入" : err), false);
-                SetLockChecked(key, false);
-                return;
-            }
-            if (!mem.EnsureWrite())
-            {
-                SetStatus("无法获取写入权限，锁定未启用", false);
+                SetStatus("无法启用锁定：存档尚未载入或未确认", false);
                 SetLockChecked(key, false);
                 return;
             }
             activeLocks.Add(key);
-            string r = locks[key].Apply(mem, c);
+            string r = ApplyLockChecked(key, expected);
             if (r == null) SetStatus("已启用 " + locks[key].Name, true);
             else
             {
+                activeLocks.Remove(key);
+                SetLockChecked(key, false);
                 SetStatus(locks[key].Name + "：" + r, false);
-                if (key == "stamina") { activeLocks.Remove(key); SetLockChecked(key, false); }
             }
         }
 
@@ -2160,6 +2358,8 @@ namespace LilliaTrainer
             bool stam = on && snap != null && snap.MainCharPresent;
             foreach (Control c in writeControls)
             {
+                if (c == cboArrayKind || c == btnMoveBackpack || c == btnMoveStorage)
+                { c.Enabled = false; continue; }
                 if (c == chkStamLock) { c.Enabled = stam; continue; }
                 c.Enabled = on;
             }
@@ -2174,31 +2374,36 @@ namespace LilliaTrainer
 
         private bool Mutate(string label, MutateFn fn)
         {
+            Gen expected = gen;
             Chain c;
             string err;
             if (!FreshChain(out c, out err)) { SetStatus("修改失败：" + err, false); return false; }
-            if (c.Save == 0) { SetStatus("尚未载入存档，无法修改", false); return false; }
+            long start = ProcStart();
+            if (!WritePolicy.Current(expected, pid, start, c))
+            {
+                // 界面快照与当前链不一致。两种情况：
+                //  a) 尚未确认（expected==null，刚启动/刚重连，首轮快照未完成）
+                //  b) 已切换（游戏重启或换了存档）
+                // 两种情况下本次 FreshChain 拿到的 c 都是实时校验过的对象，
+                //  写入目标即当前真实存档，因此采用新身份后直接继续写入，
+                //  不再要求用户重点一次（旧行为表现为"勾选被弹回"）。
+                if (pid <= 0 || start <= 0 || !Addr.Valid(c.Holder) || c.Save == 0)
+                {
+                    StopLocksAndUndo();
+                    Tick(null, null);
+                    SetStatus("存档/进程尚未就绪，本次修改已拒绝；请载入存档后重试", false);
+                    return false;
+                }
+                bool switched = expected != null;
+                if (switched) StopLocksAndUndo();   // 清锁定与撤销（gen 一并置空）
+                gen = new Gen(pid, start, c.Holder, c.Save);
+                if (switched) SetStatus("存档/进程已切换，已按当前存档写入", true);
+            }
             if (mem == null || !mem.EnsureWrite())
             {
                 SetStatus("无法获取写入权限（请以相同权限运行，必要时用管理员启动）", false);
                 return false;
             }
-            long start = ProcStart();
-            if (gen != null && !gen.Same(pid, start, c.Holder, c.Save))
-            {
-                // 界面显示的快照已过期：拒绝本次写入，避免落到刚切换的存档上
-                activeLocks.Clear();
-                undo.Clear();
-                undoBytes = 0;
-                gen = new Gen(pid, start, c.Holder, c.Save);
-                chkSpermLock.Checked = false;
-                chkStamLock.Checked = false;
-                chkDateLock.Checked = false;
-                SetStatus("存档/进程已切换，已清除锁定与撤销；请先刷新确认后再修改", false);
-                Tick(null, null);
-                return false;
-            }
-            if (gen == null) gen = new Gen(pid, start, c.Holder, c.Save);
             string r = fn(mem, c);
             if (r != null) { SetStatus("修改失败：" + r, false); return false; }
             SetStatus("已应用：" + label, true);
@@ -2287,10 +2492,11 @@ namespace LilliaTrainer
         private void DoUndo()
         {
             if (undo.Count == 0) { SetStatus("没有可撤销的本次会话修改", false); return; }
+            Gen expected = gen;
             Chain c;
             string err;
             if (!FreshChain(out c, out err)) { SetStatus("撤销失败：" + err, false); return; }
-            if (gen == null || !gen.Same(pid, ProcStart(), c.Holder, c.Save))
+            if (!WritePolicy.Current(expected, pid, ProcStart(), c))
             {
                 undo.Clear();
                 undoBytes = 0;
@@ -2412,11 +2618,23 @@ namespace LilliaTrainer
         private void ApplyBoolToggle(string label, int offset, bool value)
         {
             if (suppressCheck) return;
-            Mutate(label, delegate(IMemory m, Chain c)
+            bool ok = Mutate(label, delegate(IMemory m, Chain c)
             {
                 if (!WriteBoolSafe(m, c.Save + (ulong)offset, value)) return label + " 写入校验失败";
                 return null;
             });
+            if (!ok && !closing)
+            {
+                // 写入未成功时复选框会被轮询同步弹回，容易被误解为"勾不动"，弹窗说明原因
+                MessageBox.Show(this,
+                    "「" + label + "」写入未成功，复选框已恢复为游戏当前状态。\n\n" +
+                    "常见原因：\n" +
+                    "1) 游戏尚未载入存档（顶部显示「等待载入存档」时全部修改项为灰色禁用）\n" +
+                    "2) 修改器与游戏权限不一致（可尝试右键以管理员身份运行修改器）\n" +
+                    "3) 顶部状态不是「已连接 · 存档已载入」（游戏未启动或目录不对）\n\n" +
+                    "请确认状态正常后重新勾选。",
+                    "修改未生效", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            }
         }
 
         private static bool TryParseMask(string text, out int v)
@@ -2478,7 +2696,7 @@ namespace LilliaTrainer
                 lvItems.Items.Add(li);
             }
             lvItems.EndUpdate();
-            lblInvInfo.Text = "共 " + items.Count + " 件物品（只列出既有物品，不新增/删除/移动网格/装备）。粉色行 = 当前已装备。";
+            lblInvInfo.Text = "共 " + items.Count + " 件物品。粉色行 = 已装备；跨容器移动请在游戏内操作。";
         }
 
         private void ApplyItemCount()
@@ -2561,27 +2779,10 @@ namespace LilliaTrainer
             RefreshInventory(false);
         }
 
-        /// <summary>把选中物品移动到指定容器（1=背包 3=仓库）。只写既有 InvType 字段。</summary>
+        /// <summary>未验证原生放置规则时拒绝跨容器移动，任何调用都不会写入内存。</summary>
         private void MoveSelectedContainer(int targetInvType)
         {
-            if (lvItems == null || lvItems.SelectedItems.Count == 0) { SetStatus("请先在列表中选择一件物品", false); return; }
-            ItemView sel = lvItems.SelectedItems[0].Tag as ItemView;
-            if (sel == null) { SetStatus("选中行已失效，请刷新列表", false); return; }
-            string label = targetInvType == 1 ? "移到背包" : "移到仓库";
-            Mutate(label, delegate(IMemory m, Chain c)
-            {
-                List<ItemView> live;
-                string err;
-                if (!Data.ReadInventory(m, c, out live, out err)) return "背包读取失败：" + err;
-                ItemView cur = FindItem(live, sel);
-                if (cur == null) return "对象身份已变化，请刷新列表";
-                if (cur.State == 2) return "该物品处于已装备状态，请先在游戏内脱下再移动";
-                if (cur.InvType == targetInvType) return "该物品已在该容器中";
-                if (!Limits.I32(targetInvType, 1, 3)) return "目标容器非法";
-                if (!WriteI32Safe(m, cur.Ptr + (ulong)Off.ItemInvType, targetInvType)) return "容器字段写入校验失败";
-                return null;
-            });
-            RefreshInventory(false);
+            SetStatus(Cfg.ContainerMoveUnavailable, false);
         }
 
         // ---- 任务 ----
@@ -2775,15 +2976,24 @@ namespace LilliaTrainer
                 case 3: return Off.B0;
                 case 4: return Off.B8;
                 case 5: return Off.C0;
-                default: return Off.C8;
+                case 6: return Off.C8;
+                default: return -1;
             }
+        }
+
+        private static ArrayKind ArrayKindForField(int field)
+        {
+            ArrayKind kind;
+            Data.TryArrayKind(ArrayOffset(field), out kind);
+            return kind;
         }
 
         private void AutoKind()
         {
             if (cboArrayField == null || cboArrayKind == null) return;
             int i = cboArrayField.SelectedIndex;
-            cboArrayKind.SelectedIndex = (i == 5 || i == 6) ? 1 : 0;
+            ArrayKind kind = ArrayKindForField(i);
+            cboArrayKind.SelectedIndex = kind == ArrayKind.F64 ? 1 : kind == ArrayKind.I32 ? 0 : -1;
             RefreshArrayInfo();
         }
 
@@ -2800,7 +3010,7 @@ namespace LilliaTrainer
             ulong arr;
             int len;
             string err;
-            ArrayKind kind = cboArrayKind.SelectedIndex == 1 ? ArrayKind.F64 : ArrayKind.I32;
+            ArrayKind kind = ArrayKindForField(cboArrayField.SelectedIndex);
             if (!Data.ReadArray(mem, c, ArrayOffset(cboArrayField.SelectedIndex), kind, out arr, out len, out err))
             {
                 lblArrayInfo.Text = "数组信息不可用：" + err;
@@ -2816,17 +3026,14 @@ namespace LilliaTrainer
             if (!FreshChain(out c, out cerr) || c.Save == 0) { SetStatus("读取失败：" + (cerr == null ? "存档未载入" : cerr), false); return; }
             int idx;
             if (!int.TryParse(txtArrayIndex.Text.Trim(), out idx)) { SetStatus("下标必须是整数", false); return; }
-            ulong arr;
-            int len;
+            ulong ea;
             string err;
-            ArrayKind kind = cboArrayKind.SelectedIndex == 1 ? ArrayKind.F64 : ArrayKind.I32;
-            if (!Data.ReadArray(mem, c, ArrayOffset(cboArrayField.SelectedIndex), kind, out arr, out len, out err))
+            ArrayKind kind = ArrayKindForField(cboArrayField.SelectedIndex);
+            if (!Data.ArrayElementAddress(mem, c, ArrayOffset(cboArrayField.SelectedIndex), kind, idx, out ea, out err))
             {
                 SetStatus("读取失败：" + err, false);
                 return;
             }
-            if (idx < 0 || idx >= len) { SetStatus("下标越界（数组长度 " + len + "）", false); return; }
-            ulong ea = arr + (ulong)Off.ArrayData + (ulong)(idx * (int)kind);
             if (kind == ArrayKind.F64)
             {
                 double d;
@@ -2845,19 +3052,15 @@ namespace LilliaTrainer
         private void ApplyArrayValue()
         {
             int field = cboArrayField.SelectedIndex;
-            ArrayKind kind = cboArrayKind.SelectedIndex == 1 ? ArrayKind.F64 : ArrayKind.I32;
+            ArrayKind kind = ArrayKindForField(field);
             int idx;
             if (!int.TryParse(txtArrayIndex.Text.Trim(), out idx)) { SetStatus("下标必须是整数", false); return; }
             string raw = txtArrayValue.Text.Trim();
             Mutate("统计数组元素", delegate(IMemory m, Chain c)
             {
-                ulong arr;
-                int len;
+                ulong ea;
                 string err;
-                if (!Data.ReadArray(m, c, ArrayOffset(field), kind, out arr, out len, out err)) return err;
-                if (!Limits.I32(idx, 0, Cfg.MaxArrayElems - 1)) return "下标需在 0.." + (Cfg.MaxArrayElems - 1);
-                if (idx >= len) return "下标越界（数组长度 " + len + "）";
-                ulong ea = arr + (ulong)Off.ArrayData + (ulong)(idx * (int)kind);
+                if (!Data.ArrayElementAddress(m, c, ArrayOffset(field), kind, idx, out ea, out err)) return err;
                 if (kind == ArrayKind.F64)
                 {
                     double d;
@@ -3094,6 +3297,34 @@ namespace LilliaTrainer
 
         private bool suppressCheck;
 
+        internal bool SafetyControlsStayDisabled()
+        {
+            SetWritesEnabled(true);
+            bool disabled = !cboArrayKind.Enabled && !btnMoveBackpack.Enabled && !btnMoveStorage.Enabled;
+            SetWritesEnabled(false);
+            return disabled;
+        }
+
+        internal bool BlockedMovementLeavesDisconnected()
+        {
+            MoveSelectedContainer(1);
+            MoveSelectedContainer(3);
+            return mem == null && pid == 0 && undo.Count == 0;
+        }
+
+        internal bool ScrollAdvancedToBottom()
+        {
+            ShowPagePublic("advanced");
+            PerformLayout();
+            advancedScroll.PerformLayout();
+            advancedScroll.ScrollControlIntoView(advancedBottomCard);
+            advancedScroll.AutoScrollPosition = new Point(0, -advancedScroll.AutoScrollPosition.Y);
+            Application.DoEvents();
+            int visibleHeight = advancedScroll.ClientSize.Height;
+            return advancedScroll.VerticalScroll.Visible && advancedBottomCard.Top >= 0
+                && advancedBottomCard.Bottom <= visibleHeight;
+        }
+
         public void LoadPreviewData()
         {
             Snapshot s = new Snapshot();
@@ -3197,6 +3428,7 @@ namespace LilliaTrainer
         {
             string mode = args.Length > 0 ? args[0].ToLowerInvariant() : "";
             if (mode == "--probe") { Con.EnsureStdout(); return Probe(); }
+            if (mode == "--diag") { Con.EnsureStdout(); return Diag(); }
             if (mode == "--selftest") { Con.EnsureStdout(); return SelfTest(); }
             if (mode == "--preview") { Con.EnsureStdout(); return Preview(); }
             Application.EnableVisualStyles();
@@ -3330,6 +3562,20 @@ namespace LilliaTrainer
             return 0;
         }
 
+        private static int Diag()
+        {
+            Application.EnableVisualStyles();
+            Application.SetCompatibleTextRenderingDefault(false);
+            MainForm f = new MainForm();
+            // 手动驱动 Tick 逻辑（不进消息循环）
+            // 关键场景：gen 尚未建立（无任何 Tick）时直接勾选 —— 旧行为会拒绝写入
+            f.DiagClickNullGen();
+            System.Threading.Thread.Sleep(1200);
+            f.DiagReport();
+            f.Dispose();
+            return 0;
+        }
+
         private static bool FindGa(Process p, out ulong ga)
         {
             ga = 0;
@@ -3353,6 +3599,9 @@ namespace LilliaTrainer
             Application.EnableVisualStyles();
             Application.SetCompatibleTextRenderingDefault(false);
             MainForm f = new MainForm();
+            f.PreviewOnly = true;
+            f.ShowInTaskbar = false;
+            f.Opacity = 0;
             f.LoadPreviewData();
             f.Show();
             Application.DoEvents();
@@ -3375,6 +3624,13 @@ namespace LilliaTrainer
                 }
                 Console.WriteLine("preview -> " + outPath);
             }
+            bool bottomReachable = f.ScrollAdvancedToBottom();
+            using (Bitmap bmp = new Bitmap(f.Width, f.Height))
+            {
+                f.DrawToBitmap(bmp, new Rectangle(0, 0, f.Width, f.Height));
+                bmp.Save(Path.Combine(dir, "preview-advanced-bottom.png"), ImageFormat.Png);
+            }
+            Console.WriteLine("advanced bottom reachable: " + bottomReachable);
             f.ShowPagePublic("overview");
             Application.DoEvents();
             using (Bitmap bmp = new Bitmap(f.Width, f.Height))
@@ -3384,7 +3640,7 @@ namespace LilliaTrainer
             }
             UiLint(f, dir);
             f.Close();
-            return 0;
+            return bottomReachable ? 0 : 1;
         }
 
         /// <summary>诊断：固定宽度控件的文字溢出与负坐标检查，写入 ui-lint.txt。</summary>
@@ -3399,6 +3655,13 @@ namespace LilliaTrainer
 
         private static void WalkLint(Control root, List<string> issues, int ox, int oy)
         {
+            // Validate content coordinates; scrolled-out controls are not layout errors.
+            ScrollableControl scroll = root as ScrollableControl;
+            if (scroll != null)
+            {
+                ox -= scroll.AutoScrollPosition.X;
+                oy -= scroll.AutoScrollPosition.Y;
+            }
             foreach (Control c in root.Controls)
             {
                 int ax = ox + c.Left, ay = oy + c.Top;
@@ -3613,7 +3876,7 @@ namespace LilliaTrainer
             chk("写入 bool 成功", w4 && M.ReadBool(m, save + Off.InfinitePlay, out bb) && bb);
             bool w5 = M.WriteI32(m, item0 + Off.ItemInvType, 1);
             int ib;
-            chk("写入容器字段成功（移动到背包）", w5 && M.ReadI32(m, item0 + Off.ItemInvType, out ib) && ib == 1);
+            chk("合成内存整数写入回读（不代表跨容器移动验收）", w5 && M.ReadI32(m, item0 + Off.ItemInvType, out ib) && ib == 1);
 
             // ---- 列表 / 数组解析与边界 ----
             List<ItemView> items;
@@ -3654,14 +3917,80 @@ namespace LilliaTrainer
             W64(m, qArr + 0x18, 1UL);
 
             // ---- 统计数组 ----
-            W64(m, save + Off.D0, qArr);
+            ulong kIntArray = 0x10000200, kDoubleArray = 0x10000220;
+            ulong intArray = 0x10046000, doubleArray = 0x10047000;
+            WStr(m, 0x10044000, "Int32[]");
+            WStr(m, 0x10045000, "Double[]");
+            W64(m, kIntArray + Off.KlassName, 0x10044000);
+            W64(m, kDoubleArray + Off.KlassName, 0x10045000);
+            W64(m, intArray, kIntArray);
+            W64(m, doubleArray, kDoubleArray);
+            W64(m, intArray + Off.ArrayLength, 3UL);
+            W64(m, doubleArray + Off.ArrayLength, 2UL);
+            W32(m, intArray + Off.ArrayData, 7);
+            W32(m, intArray + Off.ArrayData + 4, 11);
+            W32(m, intArray + Off.ArrayData + 8, 13);
+            W32(m, intArray + Off.ArrayData + 12, 0x5A5A5A5A);
+            M.WriteF64(m, doubleArray + Off.ArrayData, 3.5d);
+            M.WriteF64(m, doubleArray + Off.ArrayData + 8, 42.75d);
+            W64(m, save + Off.D0, intArray);
+            W64(m, save + Off.C0, doubleArray);
             ulong gotArr;
             int gotLen;
             string aerr;
-            chk("数组读取成功", Data.ReadArray(m, c, Off.D0, ArrayKind.I32, out gotArr, out gotLen, out aerr) && gotLen == 1);
-            W64(m, qArr + 0x18, 4000UL);
+            chk("数组读取成功", Data.ReadArray(m, c, Off.D0, ArrayKind.I32, out gotArr, out gotLen, out aerr) && gotLen == 3);
+            chk("int32 字段拒绝 double 类型", !Data.ReadArray(m, c, Off.D0, ArrayKind.F64, out gotArr, out gotLen, out aerr));
+            chk("double 字段拒绝 int32 类型", !Data.ReadArray(m, c, Off.C0, ArrayKind.I32, out gotArr, out gotLen, out aerr));
+            chk("非统计字段被拒绝", !Data.ReadArray(m, c, Off.Inventory, ArrayKind.I32, out gotArr, out gotLen, out aerr));
+            W64(m, save + Off.D0, qArr);
+            chk("对象数组不能冒充 int32 数组", !Data.ReadArray(m, c, Off.D0, ArrayKind.I32, out gotArr, out gotLen, out aerr));
+            W64(m, save + Off.D0, doubleArray);
+            chk("实际 double 数组不能冒充 int32 数组", !Data.ReadArray(m, c, Off.D0, ArrayKind.I32, out gotArr, out gotLen, out aerr));
+            W64(m, save + Off.D0, intArray);
+            W64(m, intArray + Off.ArrayLength, 4000UL);
             chk("数组长度越界被拒绝", !Data.ReadArray(m, c, Off.D0, ArrayKind.I32, out gotArr, out gotLen, out aerr));
-            W64(m, qArr + 0x18, 1UL);
+            W64(m, intArray + Off.ArrayLength, 3UL);
+            ulong element;
+            bool lastElement = Data.ArrayElementAddress(m, c, Off.D0, ArrayKind.I32, 2, out element, out aerr);
+            chk("最后一个 int32 元素使用四字节步长", lastElement && element == intArray + Off.ArrayData + 8);
+            if (lastElement) M.WriteI32(m, element, 99);
+            int fence;
+            chk("末尾元素写入不会覆盖数组外哨兵", M.ReadI32(m, intArray + Off.ArrayData + 12, out fence) && fence == 0x5A5A5A5A);
+            chk("末尾之后的下标被拒绝", !Data.ArrayElementAddress(m, c, Off.D0, ArrayKind.I32, 3, out element, out aerr) && element == 0);
+            chk("负数下标被拒绝", !Data.ArrayElementAddress(m, c, Off.D0, ArrayKind.I32, -1, out element, out aerr));
+            bool doubleElement = Data.ArrayElementAddress(m, c, Off.C0, ArrayKind.F64, 1, out element, out aerr);
+            double doubleValue;
+            chk("double 数组固定八字节步长并正确读取", doubleElement && element == doubleArray + Off.ArrayData + 8
+                && M.ReadF64(m, element, out doubleValue) && doubleValue == 42.75d);
+            W64(m, intArray + Off.ArrayLength, 0UL);
+            chk("空数组没有可写元素", !Data.ArrayElementAddress(m, c, Off.D0, ArrayKind.I32, 0, out element, out aerr));
+            W64(m, intArray + Off.ArrayLength, 3UL);
+
+            // ---- 锁定必须绑定启用时的存档/进程，不匹配时不进入写入回调 ----
+            Gen lockGen = new Gen(123, 456L, holder, save);
+            Chain lockCurrent = new Chain { Holder = holder, Save = save };
+            Chain lockOther = new Chain { Holder = holder, Save = save + 0x1000UL };
+            W32(m, lockOther.Save + Off.Gold, 555);
+            int beforeGold;
+            M.ReadI32(m, save + Off.Gold, out beforeGold);
+            int lockWrites = 0;
+            Func<IMemory, Chain, string> mockLock = delegate(IMemory memory, Chain current)
+            {
+                lockWrites++;
+                return M.WriteI32(memory, current.Save + Off.Gold, 222222) ? null : "写入失败";
+            };
+            string lockError;
+            chk("切换存档时拒绝旧锁定", !WritePolicy.ApplyLock(lockGen, 123, 456L, lockOther, m, mockLock, out lockError));
+            chk("PID 复用且启动时间变化时拒绝锁定", !WritePolicy.ApplyLock(lockGen, 123, 789L, lockCurrent, m, mockLock, out lockError));
+            chk("不同进程时拒绝锁定", !WritePolicy.ApplyLock(lockGen, 124, 456L, lockCurrent, m, mockLock, out lockError));
+            chk("尚无已确认身份时拒绝锁定", !WritePolicy.ApplyLock(null, 123, 456L, lockCurrent, m, mockLock, out lockError));
+            chk("无法确认启动时间时拒绝锁定", !WritePolicy.ApplyLock(lockGen, 123, 0L, lockCurrent, m, mockLock, out lockError));
+            int unchangedGold, otherGold;
+            chk("身份被拒绝时两个存档均不写入", lockWrites == 0
+                && M.ReadI32(m, save + Off.Gold, out unchangedGold) && unchangedGold == beforeGold
+                && M.ReadI32(m, lockOther.Save + Off.Gold, out otherGold) && otherGold == 555);
+            chk("同一存档身份允许锁定回调", WritePolicy.ApplyLock(lockGen, 123, 456L, lockCurrent, m, mockLock, out lockError)
+                && lockError == null && lockWrites == 1);
 
             // ---- 掩码解析 ----
             int mv;
@@ -3702,6 +4031,25 @@ namespace LilliaTrainer
                 }
             }
             finally { System.Runtime.InteropServices.Marshal.FreeHGlobal(native); }
+
+            // Hidden UI checks never start monitoring or connect to the game.
+            Application.EnableVisualStyles();
+            Application.SetCompatibleTextRenderingDefault(false);
+            using (MainForm ui = new MainForm())
+            {
+                ui.PreviewOnly = true;
+                ui.ShowInTaskbar = false;
+                ui.Opacity = 0;
+                ui.Show();
+                Application.DoEvents();
+                chk("连接后数组类型和物品移动仍不可编辑", ui.SafetyControlsStayDisabled());
+                chk("程序化物品移动调用不连接或写入游戏", ui.BlockedMovementLeavesDisconnected());
+                chk("默认窗口能滚动到进阶页底部", ui.ScrollAdvancedToBottom());
+                ui.Size = ui.MinimumSize;
+                Application.DoEvents();
+                chk("最小窗口能滚动到进阶页底部", ui.ScrollAdvancedToBottom());
+                ui.Close();
+            }
 
             Console.WriteLine("=== selftest (合成内存，绝不接触真实游戏) ===");
             int shown = 0;
